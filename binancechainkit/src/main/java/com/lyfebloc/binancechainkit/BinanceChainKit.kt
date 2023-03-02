@@ -1,0 +1,274 @@
+package com.lyfebloc.binancechainkit
+
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import com.lyfebloc.binancechainkit.core.Asset
+import com.lyfebloc.binancechainkit.core.Wallet
+import com.lyfebloc.binancechainkit.core.api.BinanceChainApi
+import com.lyfebloc.binancechainkit.core.api.BinanceError
+import com.lyfebloc.binancechainkit.helpers.Crypto
+import com.lyfebloc.binancechainkit.managers.BalanceManager
+import com.lyfebloc.binancechainkit.models.TransactionFilterType
+import com.lyfebloc.binancechainkit.managers.TransactionManager
+import com.lyfebloc.binancechainkit.models.Balance
+import com.lyfebloc.binancechainkit.models.LatestBlock
+import com.lyfebloc.binancechainkit.models.Transaction
+import com.lyfebloc.binancechainkit.models.TransactionInfo
+import com.lyfebloc.binancechainkit.storage.KitDatabase
+import com.lyfebloc.binancechainkit.storage.Storage
+import com.lyfebloc.hdwalletkit.HDWallet
+import com.lyfebloc.hdwalletkit.Mnemonic
+import io.reactivex.BackpressureStrategy
+import io.reactivex.Flowable
+import io.reactivex.Observable
+import io.reactivex.Single
+import io.reactivex.subjects.PublishSubject
+import java.math.BigDecimal
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.TimeUnit
+import kotlin.collections.LinkedHashMap
+
+class BinanceChainKit(
+    private val account: String,
+    private val balanceManager: BalanceManager,
+    private val transactionManager: TransactionManager,
+    private val networkType: NetworkType
+) : BalanceManager.Listener, TransactionManager.Listener {
+
+    val binanceBalance: BigDecimal
+        get() = balanceManager.getBalance("BNB")?.amount ?: BigDecimal.ZERO
+
+    var latestBlock: LatestBlock? = balanceManager.latestBlock
+
+    val latestBlockFlowable: Flowable<LatestBlock>
+        get() = latestBlockSubject.toFlowable(BackpressureStrategy.BUFFER)
+
+    private val assets = mutableListOf<Asset>()
+    private val latestBlockSubject = PublishSubject.create<LatestBlock>()
+
+    var syncState: SyncState = SyncState.NotSynced(Throwable("Initial State"))
+        set(value) {
+            if (field != value) {
+                field = value
+                syncStateSubject.onNext(syncState)
+            }
+        }
+    val syncStateFlowable: Flowable<SyncState>
+        get() = syncStateSubject.toFlowable(BackpressureStrategy.BUFFER)
+    private val syncStateSubject = PublishSubject.create<SyncState>()
+
+    fun register(symbol: String): Asset {
+        val newToken = Asset(symbol, account).apply {
+            this.balance = balanceManager.getBalance(symbol)?.amount ?: BigDecimal(0)
+        }
+
+        assets.add(newToken)
+        balanceManager.sync(account)
+
+        return newToken
+    }
+
+    fun unregister(asset: Asset) {
+        assets.removeAll { it == asset }
+    }
+
+    fun refresh() {
+        if (syncState == SyncState.Syncing) return
+
+        syncState = SyncState.Syncing
+
+        balanceManager.sync(account)
+        transactionManager.sync(account)
+    }
+
+    fun stop() {
+        balanceManager.stop()
+        transactionManager.stop()
+    }
+
+    fun receiveAddress(): String {
+        return account
+    }
+
+    @Throws
+    fun validateAddress(address: String) {
+        Crypto.decodeAddress(address)
+    }
+
+    fun send(symbol: String, to: String, amount: BigDecimal, memo: String): Single<String> {
+        return transactionManager
+            .send(symbol, to, amount, memo)
+            .doOnSuccess {
+                Observable.timer(5, TimeUnit.SECONDS).subscribe {
+                    refresh()
+                }
+            }
+    }
+
+    fun getTransaction(hash: String): TransactionInfo? {
+        return transactionManager.getTransaction(hash)?.let {
+            TransactionInfo(it)
+        }
+    }
+
+    fun transactions(
+        asset: Asset,
+        filterType: TransactionFilterType? = null,
+        fromTransactionHash: String? = null,
+        limit: Int? = null
+    ): Single<List<TransactionInfo>> {
+        return transactionManager
+            .getTransactions(asset.symbol, filterType, fromTransactionHash, limit)
+            .map { list -> list.map { TransactionInfo(it) } }
+    }
+
+    fun statusInfo(): Map<String, Any> {
+        val statusInfo = LinkedHashMap<String, Any>()
+
+        statusInfo["Synced Until"] = latestBlock?.time?.let { parseLastBlockDate(it) } ?: "N/A"
+        statusInfo["Last Block Height"] = latestBlock?.height ?: "N/A"
+        statusInfo["Sync State"] = syncState.getName()
+        statusInfo["RPC Host"] = networkType.endpoint
+
+        return statusInfo
+    }
+
+    private fun parseLastBlockDate(date: String): Date? {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ENGLISH)
+        sdf.timeZone = TimeZone.getTimeZone("GMT")
+
+        return try {
+            sdf.parse(date)
+        } catch (ex: Exception) {
+            null
+        }
+    }
+
+    // BalanceManager Listener
+
+    override fun onSyncBalances(balances: List<Balance>, latestBlock: LatestBlock) {
+        balances.forEach { balance ->
+            assetBy(balance.symbol)?.let { asset ->
+                asset.balance = balance.amount
+            }
+        }
+
+        this.latestBlock = latestBlock
+        latestBlockSubject.onNext(latestBlock)
+
+        syncState = SyncState.Synced
+    }
+
+    override fun onSyncBalanceFail(error: Throwable) {
+        var throwable = error
+        if (error is BinanceError) {
+            throwable = Throwable(error.description())
+        }
+        syncState = SyncState.NotSynced(throwable)
+    }
+
+    // TransactionManager Listener
+
+    override fun onSyncTransactions(transactions: List<Transaction>) {
+        transactions.groupBy { it.symbol }
+            .forEach { (symbol, transactions) ->
+                assetBy(symbol)?.transactionsSubject?.onNext(
+                    transactions.map { TransactionInfo(it) })
+            }
+
+    }
+
+    private fun assetBy(symbol: String): Asset? {
+        return assets.find { it.symbol == symbol }
+    }
+
+    // SyncState
+
+    sealed class SyncState {
+        object Synced : SyncState()
+        class NotSynced(val error: Throwable) : SyncState()
+        object Syncing : SyncState()
+
+        fun getName(): String {
+            return when (this) {
+                Synced -> "Synced"
+                Syncing -> "Syncing"
+                is NotSynced -> "Not Synced"
+            }
+        }
+    }
+
+    enum class NetworkType {
+        MainNet,
+        TestNet;
+
+        val addressPrefix: String
+            get() = when (this) {
+                MainNet -> "bnb"
+                TestNet -> "tbnb"
+            }
+
+        val endpoint: String
+            get() = when (this) {
+                MainNet -> "https://dex.binance.org"
+                TestNet -> "https://testnet-dex.binance.org"
+            }
+
+    }
+
+    companion object {
+        fun wallet(words: List<String>, passphrase: String, networkType: NetworkType): Wallet {
+            val seed = Mnemonic().toSeed(words, passphrase)
+            val hdWallet = HDWallet(seed, coinType = 714, purpose = HDWallet.Purpose.BIP44)
+
+            return Wallet(hdWallet, networkType)
+        }
+
+        fun instance(
+            context: Context,
+            words: List<String>,
+            passphrase: String,
+            walletId: String,
+            networkType: NetworkType = NetworkType.MainNet
+        ) = instance(context, Mnemonic().toSeed(words, passphrase), walletId, networkType)
+
+        fun instance(
+            context: Context,
+            seed: ByteArray,
+            walletId: String,
+            networkType: NetworkType = NetworkType.MainNet
+        ): BinanceChainKit {
+            val database = KitDatabase.create(context, getDatabaseName(networkType, walletId))
+            val storage = Storage(database)
+
+            val hdWallet = HDWallet(seed, coinType = 714, purpose = HDWallet.Purpose.BIP44)
+
+            val wallet = Wallet(hdWallet, networkType)
+
+            val binanceApi = BinanceChainApi(networkType)
+            val balanceManager = BalanceManager(storage, binanceApi)
+            val actionManager = TransactionManager(wallet, storage, binanceApi)
+
+            val kit = BinanceChainKit(wallet.address, balanceManager, actionManager, networkType)
+
+            balanceManager.listener = kit
+            actionManager.listener = kit
+
+
+            kit.validateAddress(wallet.address)
+
+            return kit
+        }
+
+        fun clear(context: Context, networkType: NetworkType, walletId: String) {
+            SQLiteDatabase.deleteDatabase(
+                context.getDatabasePath(getDatabaseName(networkType, walletId))
+            )
+        }
+
+        private fun getDatabaseName(networkType: NetworkType, walletId: String): String {
+            return "Binance-$networkType-$walletId"
+        }
+    }
+}
